@@ -1,6 +1,6 @@
 'use strict';
 // Change CACHE with every deploy (and keep it equal to VERSION in app.js), or phones keep the old version.
-const CACHE = 'training-tracker-0.1.0';
+const CACHE = 'training-tracker-0.2.0';
 const FILES = [
   './', 'styles.css', 'theme.js', 'app.js', 'manifest.webmanifest',
   'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png',

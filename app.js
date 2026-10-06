@@ -2,7 +2,7 @@
   'use strict';
 
   // ---------- Constants ----------
-  const VERSION = '0.1.0'; // keep equal to CACHE in sw.js
+  const VERSION = '0.2.0'; // keep equal to CACHE in sw.js
   const SCHEMA = 1;
   const DB_NAME = 'training-tracker';
   const BACKUP_FILE = 'training-tracker-backup.json';
@@ -48,6 +48,12 @@
     timer: [`<circle cx="12" cy="13.5" r="7.5" ${F}/>`, `<circle cx="12" cy="13.5" r="7.5" ${S}/><path d="M12 9.5v4l2.4 1.6M9.5 3.5h5" ${S}/>`],
     flame: [`<path d="M12 3c1 3.5 5 5.5 5 10a5 5 0 0 1-10 0c0-2 1-3.2 2-4.2.2 1.2.8 1.8 1.5 2C10.4 8 11 5.5 12 3z" ${F}/>`, `<path d="M12 3c1 3.5 5 5.5 5 10a5 5 0 0 1-10 0c0-2 1-3.2 2-4.2.2 1.2.8 1.8 1.5 2C10.4 8 11 5.5 12 3z" ${S}/>`],
     bed: [`<rect x="3" y="10" width="18" height="6" rx="2" ${F}/>`, `<path d="M3 18V6M3 14h18v4M21 14v-2a3 3 0 0 0-3-3h-7v5" ${S}/>`],
+    drop: [`<path d="M12 3.5s6 6.2 6 10.5a6 6 0 0 1-12 0c0-4.3 6-10.5 6-10.5z" ${F}/>`, `<path d="M12 3.5s6 6.2 6 10.5a6 6 0 0 1-12 0c0-4.3 6-10.5 6-10.5z" ${S}/>`],
+    moon: [`<path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z" ${F}/>`, `<path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z" ${S}/>`],
+    scale: [`<rect x="4" y="4" width="16" height="16" rx="4" ${F}/>`, `<rect x="4" y="4" width="16" height="16" rx="4" ${S}/><path d="M8.5 9.5a5 5 0 0 1 7 0M12 13l2-2.5" ${S}/>`],
+    run: [`<path d="M3.5 16.5V13l4-1.5 2 2.5h4l3 1.5c2.5.3 4 .8 4 2v.5h-17z" ${F}/>`, `<path d="M3.5 16.5V13l4-1.5 2 2.5h4l3 1.5c2.5.3 4 .8 4 2v.5h-17zM3.5 19.5h17" ${S}/>`],
+    left: [``, `<path d="M14.5 5l-7 7 7 7" ${S}/>`],
+    right: [``, `<path d="M9.5 5l7 7-7 7" ${S}/>`],
     shield: [`<path d="M12 3.5l7 2.5v5.5c0 4.2-3 7.3-7 9-4-1.700-7-4.800-7-9V6l7-2.500z" ${F}/>`, `<path d="M12 3.5l7 2.5v5.5c0 4.2-3 7.3-7 9-4-1.700-7-4.800-7-9V6l7-2.500z" ${S}/><path d="M9 12l2.200 2.200L15.500 10" ${S}/>`],
   };
   function icon(name, size = 20, duo = true) {
@@ -65,7 +71,7 @@
   const parseKey = (k) => { const [y, m, d] = k.split('-').map(Number); return new Date(y, m - 1, d); };
   const daysBetween = (a, b) => Math.round((parseKey(b) - parseKey(a)) / 864e5);
   const fmtDate = (k, opts = { weekday: 'short', month: 'short', day: 'numeric' }) => parseKey(k).toLocaleDateString(undefined, opts);
-  const fmtTime = (ms) => new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const fmtTime = (ms) => new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: state.settings.units.time !== '24h' });
   const fmtClock = (sec) => `${Math.floor(sec / 60)}:${pad(sec % 60)}`;
   const fmtNum = (n) => (Number.isInteger(n) ? String(n) : String(Math.round(n * 10) / 10));
   const range = (r) => (r[0] === r[1] ? `${r[0]}` : `${r[0]}–${r[1]}`);
@@ -125,6 +131,7 @@
     view: 'today',
     settings: null,
     program: null,
+    logDate: null, // day shown in the Log tab (null = today)
     active: null, // { w: workout, sets: [], last: { [exIndex]: { date, sets } | null } }
   };
   let renderToken = 0;
@@ -139,7 +146,8 @@
       programStartDate: dateKey(d),
       dayMapping: { 0: 'rest', 1: 'rest', 2: 'rest', 3: 'rest', 4: 'rest', 5: 'rest', 6: 'rest' },
       waterQuickAdds: [8, 16, 34],
-      targets: { protein: 140, calories: 3100, waterBaseOz: 100, sleepHours: 8, runMinutesWeek: [60, 120] },
+      targets: { protein: 140, calories: 3100, waterBaseOz: 100, sleepHours: 8, bedtime: '22:30', runMinutesWeek: [60, 120] },
+      customItems: [],
       lastBackupAt: null,
     };
   }
@@ -149,6 +157,7 @@
     if (!settings) { settings = defaultSettings(); await db.put('settings', settings); }
     const base = defaultSettings();
     state.settings = { ...base, ...settings, units: { ...base.units, ...settings.units }, targets: { ...base.targets, ...settings.targets }, dayMapping: { ...base.dayMapping, ...settings.dayMapping } };
+    if (!Array.isArray(state.settings.customItems)) state.settings.customItems = [];
     let program = await db.get('program', 'main');
     if (!program) { program = structuredClone(SEED_PROGRAM); await db.put('program', program); }
     state.program = program;
@@ -366,6 +375,366 @@
     <p class="caption">This app does not include a workout program. Import yours from a JSON file to get started.</p>
     <button class="btn btn-primary" data-act="import-program">Import Program</button></section>`;
 
+  // ---------- Daily logs ----------
+  const OZ_L = 0.0295735;
+  const r1 = (n) => Math.round(n * 10) / 10;
+  const r2 = (n) => Math.round(n * 100) / 100;
+  const useL = () => state.settings.units.water === 'L';
+  const fmtWater = (oz) => (useL() ? `${r2(oz * OZ_L)} L` : `${r1(oz)} oz`);
+  const waterToDisplay = (oz) => (useL() ? r2(oz * OZ_L) : r1(oz));
+  const waterToOz = (v) => (useL() ? v / OZ_L : v);
+  const waterUnit = () => (useL() ? 'L' : 'oz');
+  const mins = (t) => { const [h, m] = String(t).split(':').map(Number); return h * 60 + m; };
+  const hhmm = (ms) => { const d = new Date(ms); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+  const fmtHM = (t) => {
+    if (!t) return '—';
+    if (state.settings.units.time === '24h') return t;
+    const [h, m] = t.split(':').map(Number);
+    return `${h % 12 || 12}:${pad(m)} ${h < 12 ? 'AM' : 'PM'}`;
+  };
+  // Hours slept; handles bedtimes before midnight. Returns null when bed and wake are equal.
+  function sleepHours(bed, wake) {
+    let d = mins(wake) - mins(bed);
+    if (d < 0) d += 1440;
+    return d === 0 ? null : r1(d / 60);
+  }
+  // Times before noon count as "after midnight", so 12:30 AM is later than 11 PM.
+  const lateAdj = (m) => (m < 720 ? m + 1440 : m);
+  const bedOnTime = (bed) => lateAdj(mins(bed)) <= lateAdj(mins(state.settings.targets.bedtime));
+  function parseDuration(v) {
+    v = String(v).trim();
+    if (!v) return null;
+    if (v.includes(':')) { const [m, s] = v.split(':'); const mm = num(m), ss = num(s); return mm == null || ss == null ? null : mm + ss / 60; }
+    return num(v);
+  }
+  function fmtPace(min, mi) {
+    const sec = Math.round((min * 60) / mi);
+    return `${Math.floor(sec / 60)}:${pad(sec % 60)}`;
+  }
+  const fmtDur = (min) => `${r1(min)} min`;
+
+  async function dayData(date) {
+    const [water, sleepRows, weight, nutrition, checklist, runs, workouts] = await Promise.all([
+      db.byIndex('water', 'date', date), db.byIndex('sleep', 'date', date), db.get('bodyweight', date),
+      db.get('nutrition', date), db.get('checklist', date), db.byIndex('runs', 'date', date), db.byIndex('workouts', 'date', date),
+    ]);
+    return {
+      date, water: water.sort((a, b) => a.timestamp - b.timestamp), sleep: sleepRows[0] || null, weight: weight || null,
+      nutrition: nutrition || null, checklist: checklist || { date, creatine: false, items: {} },
+      runs, workouts: workouts.filter((w) => w.status === 'done'),
+    };
+  }
+  const sumOz = (d) => d.water.reduce((n, w) => n + w.amountOz, 0);
+
+  // Checklist rows. Auto rows tick themselves from logged data; manual rows toggle on tap.
+  function checklistItems(d) {
+    const t = state.settings.targets;
+    const total = sumOz(d);
+    const protein = d.nutrition?.proteinG ?? null;
+    const items = [
+      { key: 'creatine', label: 'Creatine (5 g)', done: !!d.checklist.creatine, sub: 'Tap to check off', act: 'toggle' },
+      { key: 'protein', label: 'Protein target hit', done: protein != null && protein >= t.protein, sub: `${protein ?? 0} of ${t.protein} g`, act: 'sheet-nutrition' },
+      { key: 'water', label: 'Water target hit', done: total >= t.waterBaseOz, sub: `${fmtWater(total)} of ${fmtWater(t.waterBaseOz)}`, act: 'sheet-water' },
+      { key: 'weight', label: 'Weighed in', done: !!d.weight, sub: d.weight ? `${fmtNum(d.weight.weightLb)} lb` : 'Morning weight', act: 'sheet-weight' },
+      { key: 'sleep', label: 'Logged sleep', done: !!d.sleep, sub: d.sleep ? `${d.sleep.hours} h` : 'Bedtime and wake time', act: 'sheet-sleep' },
+      { key: 'bed', label: 'In bed on time', done: !!d.sleep && bedOnTime(d.sleep.bedtime), sub: d.sleep ? `Bedtime ${fmtHM(d.sleep.bedtime)}` : `Target ${fmtHM(t.bedtime)}`, act: 'sheet-sleep' },
+    ];
+    for (const it of state.settings.customItems) items.push({ key: it.id, label: it.label, done: !!d.checklist.items?.[it.id], sub: 'Tap to check off', act: 'toggle' });
+    return items;
+  }
+  function checklistCard(d, date) {
+    const items = checklistItems(d);
+    const n = items.filter((i) => i.done).length;
+    return `<section class="card">${cardHead('check', 'Daily Checklist', `<span class="pill ${n === items.length ? 'good-pill' : 'soft-pill'}">${n} of ${items.length}</span>`)}
+      <div class="rows">${items.map((i) => `<button class="list-btn" data-act="${i.act}" data-key="${esc(i.key)}" data-date="${date}" aria-pressed="${i.done}">
+        <span class="tick${i.done ? ' on' : ''}">${icon('check', 16, false)}</span>
+        <div class="main"><p class="t">${esc(i.label)}</p><p class="s">${esc(i.sub)}</p></div></button>`).join('')}</div></section>`;
+  }
+  async function toggleItem(date, key) {
+    const c = (await db.get('checklist', date)) || { date, creatine: false, items: {} };
+    if (key === 'creatine') c.creatine = !c.creatine;
+    else c.items = { ...c.items, [key]: !c.items?.[key] };
+    if (await persist([['put', 'checklist', c]])) render();
+  }
+
+  async function persist(ops) {
+    try { await db.write(ops); return true; }
+    catch { toast('Could not save. Browser storage is full or blocked.'); return false; }
+  }
+  async function removeWithUndo(storeName, rec) {
+    const key = rec[STORES[storeName].keyPath];
+    if (!(await persist([['delete', storeName, key]]))) return;
+    toast('Deleted', { action: 'Undo', duration: 5000, onAction: async () => { if (await persist([['put', storeName, rec]])) render(); } });
+    render();
+  }
+
+  async function addWater(date, oz) {
+    const rec = { id: uid(), date, amountOz: oz, timestamp: Date.now() };
+    if (!(await persist([['put', 'water', rec]]))) return;
+    toast(`+${fmtWater(oz)}`, { action: 'Undo', duration: 4000, onAction: async () => { if (await persist([['delete', 'water', rec.id]])) render(); } });
+    render();
+  }
+
+  // Generic form sheet: onSave(dlg, fail) returns false to keep the sheet open.
+  function formSheet({ title, body, onSave, onDelete, onInput, onClick }) {
+    const dlg = openSheet(title, `<div class="stack">${body}<p class="caption err" id="sheet-err" hidden></p>
+      <button class="btn btn-primary" data-save>Save</button>${onDelete ? '<button class="btn btn-danger" data-delete>Delete</button>' : ''}<button class="btn btn-outline" data-cancel>Cancel</button></div>`);
+    const fail = (m) => { const el = $('#sheet-err', dlg); el.textContent = m; el.hidden = false; return false; };
+    const save = async () => { if ((await onSave(dlg, fail)) !== false) dlg.close(); };
+    dlg.onclick = (e) => {
+      if (e.target === dlg || e.target.closest('[data-cancel]')) return dlg.close();
+      if (e.target.closest('[data-save]')) return save();
+      if (e.target.closest('[data-delete]')) { dlg.close(); return onDelete(); }
+      onClick && onClick(e, dlg);
+    };
+    dlg.onkeydown = (e) => { if (e.key === 'Enter' && e.target.tagName === 'INPUT') { e.preventDefault(); save(); } };
+    if (onInput) { dlg.oninput = () => onInput(dlg); onInput(dlg); }
+    const first = $('input:not([type=time])', dlg);
+    if (first) first.focus();
+    return dlg;
+  }
+  const segHtml = (id, opts, cur) => `<div class="seg" id="${id}">${opts.map(([v, l]) => `<button type="button" data-v="${esc(v)}" aria-pressed="${String(cur) === String(v)}">${esc(l)}</button>`).join('')}</div>`;
+  function segPick(e, dlg, id) {
+    const b = e.target.closest(`#${id} [data-v]`);
+    if (!b) return null;
+    const already = b.getAttribute('aria-pressed') === 'true';
+    $$(`#${id} button`, dlg).forEach((x) => x.setAttribute('aria-pressed', 'false'));
+    if (already) return '';
+    b.setAttribute('aria-pressed', 'true');
+    return b.dataset.v;
+  }
+
+  async function waterSheet(date, id) {
+    const entry = id ? await db.get('water', id) : null;
+    const time = entry ? hhmm(entry.timestamp) : date === dateKey() ? hhmm(Date.now()) : '12:00';
+    formSheet({
+      title: entry ? 'Edit Water' : 'Add Water',
+      body: `<label class="field"><span>Amount (${waterUnit()})</span><input class="input" id="f-amt" inputmode="decimal" value="${entry ? esc(waterToDisplay(entry.amountOz)) : ''}"></label>
+        <label class="field"><span>Time</span><input class="input" type="time" id="f-time" value="${time}"></label>`,
+      onSave: async (dlg, fail) => {
+        const v = num($('#f-amt', dlg).value);
+        const oz = v == null ? null : waterToOz(v);
+        if (!oz || oz <= 0 || oz > 300) return fail('Enter an amount greater than 0.');
+        const t = $('#f-time', dlg).value || time;
+        const ts = parseKey(date).getTime() + mins(t) * 60000;
+        const rec = entry ? { ...entry, amountOz: oz, timestamp: ts } : { id: uid(), date, amountOz: oz, timestamp: ts };
+        if (!(await persist([['put', 'water', rec]]))) return false;
+        render();
+      },
+      onDelete: entry && (() => removeWithUndo('water', entry)),
+    });
+  }
+
+  async function sleepSheet(date) {
+    const ex = (await db.byIndex('sleep', 'date', date))[0] || null;
+    let quality = ex ? ex.quality : null;
+    formSheet({
+      title: 'Sleep',
+      body: `<p class="caption">The night that ended on ${esc(fmtDate(date))}.</p>
+        <div class="two"><label class="field"><span>Bedtime</span><input class="input" type="time" id="f-bed" value="${esc(ex ? ex.bedtime : state.settings.targets.bedtime)}"></label>
+        <label class="field"><span>Wake time</span><input class="input" type="time" id="f-wake" value="${esc(ex ? ex.wakeTime : '06:30')}"></label></div>
+        <p class="big" id="f-hours"></p>
+        <div><p class="caption" style="margin-bottom:8px">Quality (optional)</p>${segHtml('f-q', [1, 2, 3, 4, 5].map((n) => [n, n]), quality)}</div>`,
+      onInput: (dlg) => {
+        const bed = $('#f-bed', dlg).value, wake = $('#f-wake', dlg).value;
+        const h = bed && wake ? sleepHours(bed, wake) : null;
+        $('#f-hours', dlg).textContent = h == null ? '— h' : `${h} h${h < 7 ? ' · under 7 h' : ''}`;
+      },
+      onClick: (e, dlg) => { const v = segPick(e, dlg, 'f-q'); if (v !== null) quality = v === '' ? null : Number(v); },
+      onSave: async (dlg, fail) => {
+        const bed = $('#f-bed', dlg).value, wake = $('#f-wake', dlg).value;
+        if (!bed || !wake) return fail('Enter a bedtime and a wake time.');
+        const hours = sleepHours(bed, wake);
+        if (hours == null) return fail('Bedtime and wake time cannot be the same.');
+        const rec = { id: ex ? ex.id : `sleep:${date}`, date, bedtime: bed, wakeTime: wake, hours, quality };
+        if (!(await persist([['put', 'sleep', rec]]))) return false;
+        render();
+      },
+      onDelete: ex && (() => removeWithUndo('sleep', ex)),
+    });
+  }
+
+  async function weightSheet(date) {
+    const ex = await db.get('bodyweight', date);
+    formSheet({
+      title: 'Morning Weight',
+      body: `<label class="field"><span>Weight (lb)</span><input class="input" id="f-w" inputmode="decimal" value="${ex ? esc(fmtNum(ex.weightLb)) : ''}"></label>`,
+      onSave: async (dlg, fail) => {
+        const w = num($('#f-w', dlg).value);
+        if (w == null || w < 40 || w > 800) return fail('Enter a weight between 40 and 800 lb.');
+        const ops = [['put', 'bodyweight', { date, weightLb: r1(w) }]];
+        if (state.settings.bodyweightLb == null) { state.settings.bodyweightLb = r1(w); saveSettings(); }
+        if (!(await persist(ops))) return false;
+        render();
+      },
+      onDelete: ex && (() => removeWithUndo('bodyweight', ex)),
+    });
+  }
+
+  async function nutritionSheet(date) {
+    const ex = await db.get('nutrition', date);
+    formSheet({
+      title: 'Nutrition',
+      body: `<label class="field"><span>Protein today (g)</span><input class="input" id="f-p" inputmode="numeric" value="${ex && ex.proteinG != null ? esc(ex.proteinG) : ''}"></label>
+        <div class="chips">${[10, 25, 40].map((n) => `<button type="button" class="chip" data-add="${n}">+${n} g</button>`).join('')}</div>
+        <label class="field"><span>Calories today (optional)</span><input class="input" id="f-c" inputmode="numeric" value="${ex && ex.calories != null ? esc(ex.calories) : ''}"></label>`,
+      onClick: (e, dlg) => {
+        const b = e.target.closest('[data-add]');
+        if (b) { const f = $('#f-p', dlg); f.value = Math.round((num(f.value) || 0) + Number(b.dataset.add)); }
+      },
+      onSave: async (dlg, fail) => {
+        const p = num($('#f-p', dlg).value), c = num($('#f-c', dlg).value);
+        if (p == null && c == null) return fail('Enter protein, calories or both.');
+        if ((p != null && (p < 0 || p > 1000)) || (c != null && (c < 0 || c > 20000))) return fail('Those numbers look too large.');
+        if (!(await persist([['put', 'nutrition', { date, proteinG: p == null ? null : Math.round(p), calories: c == null ? null : Math.round(c) }]]))) return false;
+        render();
+      },
+      onDelete: ex && (() => removeWithUndo('nutrition', ex)),
+    });
+  }
+
+  async function runSheet(date, id) {
+    const run = id ? await db.get('runs', id) : null;
+    let type = run ? run.type : 'easy';
+    const rpeOpts = ['<option value="">—</option>', ...Array.from({ length: 10 }, (_, i) => `<option value="${i + 1}"${run && run.rpe === i + 1 ? ' selected' : ''}>${i + 1}</option>`)].join('');
+    formSheet({
+      title: run ? 'Edit Run' : 'Log Run',
+      body: `<div class="two"><label class="field"><span>Distance (mi)</span><input class="input" id="f-dist" inputmode="decimal" value="${run ? esc(r2(run.distanceMi)) : ''}"></label>
+        <label class="field"><span>Time (min)</span><input class="input" id="f-dur" inputmode="decimal" placeholder="45 or 45:30" value="${run ? esc(r1(run.durationMin)) : ''}"></label></div>
+        <p class="big" id="f-pace"></p>
+        ${segHtml('f-type', [['easy', 'Easy'], ['intervals', 'Intervals'], ['long', 'Long']], type)}
+        <label class="field"><span>Effort, RPE 1–10 (optional)</span><select class="input" id="f-rpe">${rpeOpts}</select></label>
+        <label class="field"><span>Note (optional)</span><input class="input" id="f-note" maxlength="200" value="${run ? esc(run.note || '') : ''}"></label>`,
+      onInput: (dlg) => {
+        const d = num($('#f-dist', dlg).value), m = parseDuration($('#f-dur', dlg).value);
+        $('#f-pace', dlg).textContent = d > 0 && m > 0 ? `${fmtPace(m, d)} /mi` : 'Pace shows here';
+      },
+      onClick: (e, dlg) => { const v = segPick(e, dlg, 'f-type'); if (v) type = v; else if (v === '') $(`#f-type [data-v="${type}"]`, dlg).setAttribute('aria-pressed', 'true'); },
+      onSave: async (dlg, fail) => {
+        const d = num($('#f-dist', dlg).value), m = parseDuration($('#f-dur', dlg).value);
+        if (!d || d <= 0 || d > 100) return fail('Enter a distance between 0 and 100 miles.');
+        if (!m || m <= 0 || m > 600) return fail('Enter the time in minutes, like 45 or 45:30.');
+        const rpe = $('#f-rpe', dlg).value;
+        const rec = { id: run ? run.id : uid(), date, distanceMi: r2(d), durationMin: r2(m), paceSecPerMi: Math.round((m * 60) / d), type, rpe: rpe ? Number(rpe) : null, note: $('#f-note', dlg).value.trim().slice(0, 200) };
+        if (!(await persist([['put', 'runs', rec]]))) return false;
+        render();
+      },
+      onDelete: run && (() => removeWithUndo('runs', run)),
+    });
+  }
+
+  // ---------- Render: Today extras ----------
+  const meter = (label, value, pct) => `<div class="meter"><div class="meter-top"><span>${label}</span><strong>${value}</strong></div><div class="bar"><i style="width:${Math.max(0, Math.min(100, pct))}%"></i></div></div>`;
+  function quickAddCard(date) {
+    const amounts = state.settings.waterQuickAdds;
+    const q = (act, ic, label) => `<button class="q-btn" data-act="${act}" data-date="${date}">${icon(ic, 24)}<span>${label}</span></button>`;
+    return `<section class="card">${cardHead('drop', 'Quick Add')}
+      <div class="quick3">${amounts.map((oz) => `<button class="btn btn-navy btn-small" data-act="water-add" data-oz="${oz}" data-date="${date}">+${esc(fmtWater(oz))}</button>`).join('')}</div>
+      <div class="quick4">${q('sheet-weight', 'scale', 'Weigh-In')}${q('sheet-sleep', 'moon', 'Sleep')}${q('sheet-nutrition', 'flame', 'Protein')}${q('sheet-run', 'run', 'Run')}</div></section>`;
+  }
+  function metersCard(d) {
+    const t = state.settings.targets;
+    const total = sumOz(d);
+    const p = d.nutrition?.proteinG ?? 0;
+    const h = d.sleep ? d.sleep.hours : null;
+    return `<section class="card">${cardHead('chart', 'Today So Far')}
+      ${meter('Water', `${esc(fmtWater(total))} / ${esc(fmtWater(t.waterBaseOz))}`, (total / t.waterBaseOz) * 100)}
+      ${meter('Protein', `${p} / ${t.protein} g`, (p / t.protein) * 100)}
+      ${meter('Sleep last night', `${h == null ? '—' : h} / ${t.sleepHours} h`, h == null ? 0 : (h / t.sleepHours) * 100)}</section>`;
+  }
+
+  // ---------- Render: Log ----------
+  async function historyRows(n = 14) {
+    const [water, sleep, bw, nut, runs, ws] = await Promise.all(['water', 'sleep', 'bodyweight', 'nutrition', 'runs', 'workouts'].map((s) => db.all(s)));
+    const rows = [];
+    for (let i = 0; i < n; i++) {
+      const dt = new Date(); dt.setDate(dt.getDate() - i);
+      const k = dateKey(dt);
+      const parts = [];
+      const oz = water.filter((w) => w.date === k).reduce((s, w) => s + w.amountOz, 0);
+      if (oz) parts.push(fmtWater(oz));
+      const nu = nut.find((x) => x.date === k);
+      if (nu && nu.proteinG != null) parts.push(`${nu.proteinG} g protein`);
+      const sl = sleep.find((x) => x.date === k);
+      if (sl) parts.push(`${sl.hours} h sleep`);
+      const lifts = ws.filter((w) => w.date === k && w.status === 'done');
+      if (lifts.length) parts.push(lifts.map((w) => shortName(w.sessionName)).join(', '));
+      const rn = runs.filter((r) => r.date === k);
+      if (rn.length) parts.push(`${r1(rn.reduce((s, r) => s + r.distanceMi, 0))} mi run`);
+      const b = bw.find((x) => x.date === k);
+      rows.push({ k, text: parts.join(' · ') || 'No entries', weight: b ? b.weightLb : null });
+    }
+    return rows;
+  }
+
+  async function renderLog() {
+    const today = dateKey();
+    const date = state.logDate || today;
+    const d = await dayData(date);
+    const t = state.settings.targets;
+    const total = sumOz(d);
+    const main = (a, b) => `<div class="main"><p class="t">${a}</p>${b ? `<p class="s">${b}</p>` : ''}</div>`;
+    let html = pageHead('log', 'Log', fmtDate(date, { weekday: 'long', month: 'short', day: 'numeric' }));
+
+    html += `<section class="card"><div class="datenav">
+      <button class="chip" data-act="log-prev" aria-label="Previous day">${icon('left', 18, false)}</button>
+      <input class="input" type="date" data-logdate max="${today}" value="${date}" aria-label="Day">
+      <button class="chip" data-act="log-next" aria-label="Next day"${date >= today ? ' disabled' : ''}>${icon('right', 18, false)}</button></div>
+      ${date !== today ? '<button class="btn btn-outline btn-small" data-act="log-today">Back to Today</button>' : ''}</section>`;
+
+    html += checklistCard(d, date);
+
+    html += `<section class="card">${cardHead('drop', 'Water', `<span class="pill ${total >= t.waterBaseOz ? 'good-pill' : 'soft-pill'}">${esc(fmtWater(total))} / ${esc(fmtWater(t.waterBaseOz))}</span>`)}
+      ${d.water.length ? `<div class="rows">${d.water.map((w) => `<button class="list-btn" data-act="edit-water" data-id="${esc(w.id)}" data-date="${date}">${main(esc(fmtTime(w.timestamp)))}<span class="v">${esc(fmtWater(w.amountOz))}</span></button>`).join('')}</div>` : '<p class="caption">No water logged.</p>'}
+      <button class="btn btn-outline" data-act="sheet-water" data-date="${date}">Add Water</button></section>`;
+
+    const s = d.sleep;
+    html += `<section class="card">${cardHead('moon', 'Sleep')}
+      ${s ? `<div class="rows"><button class="list-btn" data-act="sheet-sleep" data-date="${date}">${main(`${esc(fmtHM(s.bedtime))} to ${esc(fmtHM(s.wakeTime))}`, `Quality ${s.quality == null ? '—' : s.quality} of 5`)}${s.hours < 7 ? '<span class="pill warn-pill">Under 7 h</span>' : ''}<span class="v">${s.hours} h</span></button></div>` : '<p class="caption">No sleep logged for the night before.</p>'}
+      <button class="btn btn-outline" data-act="sheet-sleep" data-date="${date}">${s ? 'Edit Sleep' : 'Log Sleep'}</button></section>`;
+
+    html += `<section class="card">${cardHead('scale', 'Bodyweight')}
+      ${d.weight ? `<p class="big">${esc(fmtNum(d.weight.weightLb))} lb</p>` : '<p class="caption">No weigh-in yet.</p>'}
+      <button class="btn btn-outline" data-act="sheet-weight" data-date="${date}">${d.weight ? 'Edit Weight' : 'Log Weight'}</button></section>`;
+
+    const n = d.nutrition;
+    html += `<section class="card">${cardHead('flame', 'Nutrition')}
+      ${n ? `<div class="rows"><button class="list-btn" data-act="sheet-nutrition" data-date="${date}">${main(`${n.proteinG ?? 0} g protein`, n.calories != null ? `${n.calories} calories` : 'Calories not logged')}<span class="v">${n.proteinG ?? 0} / ${t.protein} g</span></button></div>` : '<p class="caption">Nothing logged.</p>'}
+      <button class="btn btn-outline" data-act="sheet-nutrition" data-date="${date}">${n ? 'Edit Nutrition' : 'Log Nutrition'}</button></section>`;
+
+    html += `<section class="card">${cardHead('dumbbell', 'Training')}
+      ${d.workouts.length || d.runs.length ? `<div class="rows">
+        ${d.workouts.map((w) => `<div class="row"><div class="badge">${icon('dumbbell', 18, false)}</div>${main(esc(shortName(w.sessionName)), 'Lifting')}<span class="v">${Math.max(1, Math.round(((w.finishedAt || w.startedAt) - w.startedAt) / 60000))} min</span></div>`).join('')}
+        ${d.runs.map((r) => `<button class="list-btn" data-act="edit-run" data-id="${esc(r.id)}" data-date="${date}"><div class="badge">${icon('run', 18, false)}</div>${main(`${esc(r2(r.distanceMi))} mi · ${esc(r.type)}`, `${esc(fmtPace(r.durationMin, r.distanceMi))} /mi${r.rpe ? ` · RPE ${r.rpe}` : ''}`)}<span class="v">${esc(fmtDur(r.durationMin))}</span></button>`).join('')}</div>` : '<p class="caption">No training logged.</p>'}
+      <button class="btn btn-outline" data-act="sheet-run" data-date="${date}">Log Run</button></section>`;
+
+    const hist = await historyRows();
+    html += `<section class="card">${cardHead('today', 'Recent Days')}<div class="rows">${hist.map((h) => `<button class="list-btn" data-act="pick-day" data-date="${h.k}">${main(esc(fmtDate(h.k)) + (h.k === date ? ' · viewing' : ''), esc(h.text))}${h.weight != null ? `<span class="v">${esc(fmtNum(h.weight))} lb</span>` : ''}</button>`).join('')}</div></section>`;
+    return html;
+  }
+
+  // ---------- Settings: daily logging ----------
+  function renderLoggingSettings() {
+    const s = state.settings, t = s.targets;
+    const seg = (k, opts, cur) => `<div class="seg">${opts.map(([v, l]) => `<button data-act="unit" data-k="${k}" data-v="${v}" aria-pressed="${cur === v}">${l}</button>`).join('')}</div>`;
+    return `<section class="card">${cardHead('gear', 'Units')}
+        <div class="field"><span>Water</span>${seg('water', [['oz', 'Ounces'], ['L', 'Liters']], s.units.water)}</div>
+        <div class="field"><span>Time</span>${seg('time', [['12h', '12-Hour'], ['24h', '24-Hour']], s.units.time)}</div></section>
+      <section class="card">${cardHead('chart', 'Daily Targets')}
+        <label class="field"><span>Protein (g)</span><input class="input" inputmode="numeric" data-target="protein" value="${esc(t.protein)}"></label>
+        <label class="field"><span>Calories (optional)</span><input class="input" inputmode="numeric" data-target="calories" value="${esc(t.calories)}"></label>
+        <label class="field"><span>Water (oz)</span><input class="input" inputmode="numeric" data-target="waterBaseOz" value="${esc(t.waterBaseOz)}"></label>
+        <label class="field"><span>Sleep (hours)</span><input class="input" inputmode="decimal" data-target="sleepHours" value="${esc(t.sleepHours)}"></label>
+        <label class="field"><span>Bedtime target</span><input class="input" type="time" data-target="bedtime" value="${esc(t.bedtime)}"></label></section>
+      <section class="card">${cardHead('drop', 'Water Quick-Add Buttons')}
+        <div class="quick3">${s.waterQuickAdds.map((oz, i) => `<input class="input" inputmode="decimal" data-qa="${i}" value="${esc(oz)}" aria-label="Button ${i + 1} in ounces">`).join('')}</div>
+        <p class="caption">Amounts in ounces. 34 oz is about 1 L.</p></section>
+      <section class="card">${cardHead('check', 'Checklist Items')}
+        <p class="caption">Creatine and the automatic items are built in. Add your own, like a vitamin or stretching.</p>
+        ${s.customItems.length ? `<div class="rows">${s.customItems.map((it) => `<div class="row"><div class="main"><p class="t">${esc(it.label)}</p></div><button class="chip" data-act="rm-item" data-id="${esc(it.id)}">Remove</button></div>`).join('')}</div>` : ''}
+        <div class="two"><input class="input" id="new-item" maxlength="30" placeholder="New item" aria-label="New checklist item"><button class="btn btn-outline" data-act="add-item">Add</button></div></section>`;
+  }
+
   // ---------- Render: Today ----------
   async function renderToday() {
     const today = dateKey();
@@ -402,7 +771,7 @@
           <button class="btn btn-primary" data-act="start" data-session="${esc(plan.session.id)}">${doneToday ? 'Start Another Workout' : 'Start Workout'}</button>`;
       } else if (plan.kind === 'run') {
         body = `<div><p class="caption">Today's plan</p><p class="big">${esc(plan.label)}</p><p class="caption">${esc(plan.note || '')}</p></div>
-          <p class="caption">Run logging arrives in Phase 2.</p>`;
+          <button class="btn btn-primary" data-act="sheet-run" data-date="${today}">Log Run</button>`;
       } else {
         body = `<div><p class="caption">Today's plan</p><p class="big">Rest Day</p><p class="caption">Recover, eat, hydrate and sleep well.</p></div>`;
       }
@@ -416,6 +785,9 @@
           <button class="btn btn-outline" data-act="start" data-session="${esc(due.id)}">Start ${esc(shortName(due.name))}</button></section>`;
       }
     }
+
+    const dd = await dayData(today);
+    html += quickAddCard(today) + metersCard(dd) + checklistCard(dd, today);
 
     if (done.length) {
       const recent = done.slice(0, 3);
@@ -489,9 +861,7 @@
        <button class="btn btn-danger" data-act="discard">Discard Workout</button>`;
   }
 
-  // ---------- Render: Log, Progress (later phases) ----------
-  const renderLog = () => pageHead('log', 'Log', 'Daily entries') +
-    `<section class="card"><div class="empty">Water, sleep, bodyweight, nutrition, creatine and run logging arrive in Phase 2.</div></section>`;
+  // ---------- Render: Progress (later phase) ----------
   const renderProgress = () => pageHead('chart', 'Progress', 'Trends over time') +
     `<section class="card"><div class="empty">Charts, personal records and streaks arrive in Phase 4. Your workouts are already being saved for them.</div></section>`;
 
@@ -507,6 +877,7 @@
     return pageHead('gear', 'Settings', `Version ${VERSION}`) +
       `<section class="card">${cardHead('gear', 'Appearance')}
         <div class="seg" role="group" aria-label="Appearance">${[['dark', 'Dark'], ['light', 'Light'], ['system', 'Match Phone']].map(([v, l]) => `<button data-act="mode" data-mode="${v}" aria-pressed="${mode === v}">${l}</button>`).join('')}</div></section>
+      ${renderLoggingSettings()}
       <section class="card">${cardHead('dumbbell', 'Program')}
         <p class="caption">${state.program.sessions.length ? `${state.program.sessions.length} sessions loaded: ${esc(state.program.sessions.map((x) => shortName(x.name)).join(', '))}.` : 'No program loaded.'}</p>
         <button class="btn btn-outline" data-act="import-program">${icon('download', 20, false)}Import Program File</button>
@@ -535,7 +906,7 @@
     let html = '';
     if (v === 'today') html = await renderToday();
     else if (v === 'train') html = renderTrain();
-    else if (v === 'log') html = renderLog();
+    else if (v === 'log') html = await renderLog();
     else if (v === 'progress') html = renderProgress();
     else html = renderSettings();
     if (token !== renderToken) return; // a newer render replaced this one
@@ -566,6 +937,8 @@
   function openSheet(title, html) {
     const dlg = $('#sheet');
     dlg.innerHTML = `<div class="handle"></div><h2>${esc(title)}</h2>${html}`;
+    dlg.oninput = null;
+    dlg.onkeydown = null;
     dlg.onclick = (e) => { if (e.target === dlg) dlg.close(); };
     dlg.showModal();
     return dlg;
@@ -742,6 +1115,37 @@
         applyMode(); return render();
       }
 
+      const date = btn.dataset.date || (state.view === 'log' ? state.logDate || dateKey() : dateKey());
+      if (act === 'water-add') return addWater(date, Number(btn.dataset.oz));
+      if (act === 'sheet-water') return waterSheet(date);
+      if (act === 'edit-water') return waterSheet(date, btn.dataset.id);
+      if (act === 'sheet-sleep') return sleepSheet(date);
+      if (act === 'sheet-weight') return weightSheet(date);
+      if (act === 'sheet-nutrition') return nutritionSheet(date);
+      if (act === 'sheet-run') return runSheet(date);
+      if (act === 'edit-run') return runSheet(date, btn.dataset.id);
+      if (act === 'toggle') return toggleItem(date, btn.dataset.key);
+      if (act === 'log-prev' || act === 'log-next') {
+        const d = parseKey(state.logDate || dateKey());
+        d.setDate(d.getDate() + (act === 'log-next' ? 1 : -1));
+        if (dateKey(d) > dateKey()) return;
+        state.logDate = dateKey(d); return render();
+      }
+      if (act === 'log-today') { state.logDate = null; return render(); }
+      if (act === 'pick-day') { state.logDate = btn.dataset.date; render(); return window.scrollTo(0, 0); }
+      if (act === 'unit') { state.settings.units[btn.dataset.k] = btn.dataset.v; await saveSettings(); return render(); }
+      if (act === 'add-item') {
+        const label = $('#new-item').value.trim().slice(0, 30);
+        if (!label) return;
+        if (state.settings.customItems.length >= 10) return toast('That is the maximum of 10 items.');
+        state.settings.customItems.push({ id: uid(), label });
+        await saveSettings(); return render();
+      }
+      if (act === 'rm-item') {
+        state.settings.customItems = state.settings.customItems.filter((x) => x.id !== btn.dataset.id);
+        await saveSettings(); return render();
+      }
+
       const a = state.active;
       if (!a) return;
       if (act === 'swap') return swapSheet(i);
@@ -793,6 +1197,18 @@
         if (s) { readRow(row, s); await saveSet(s); }
         return;
       }
+      if (t.dataset.target) {
+        const k = t.dataset.target, tg = state.settings.targets;
+        if (k === 'bedtime') { if (t.value) tg.bedtime = t.value; else t.value = tg.bedtime; }
+        else { const v = num(t.value); if (v != null && v > 0) tg[k] = v; else t.value = tg[k]; }
+        await saveSettings(); return;
+      }
+      if (t.dataset.qa !== undefined) {
+        const i = Number(t.dataset.qa), v = num(t.value);
+        if (v != null && v > 0 && v <= 300) state.settings.waterQuickAdds[i] = v; else t.value = state.settings.waterQuickAdds[i];
+        await saveSettings(); return;
+      }
+      if (t.dataset.logdate !== undefined) { if (t.value && t.value <= dateKey()) { state.logDate = t.value; render(); } return; }
       if (t.dataset.day !== undefined) { state.settings.dayMapping[t.dataset.day] = t.value; await saveSettings(); toast('Schedule updated'); return; }
       if (t.dataset.setting === 'bodyweightLb') { state.settings.bodyweightLb = num(t.value); await saveSettings(); return; }
       if (t.dataset.setting === 'programStartDate' && t.value) { state.settings.programStartDate = t.value; await saveSettings(); render(); }
@@ -821,6 +1237,7 @@
       if (document.visibilityState === 'visible') {
         tick();
         if (state.active && state.view === 'train') acquireWake();
+        if (state.view === 'today') render(); // a new day may have started
       }
     });
     matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyMode);

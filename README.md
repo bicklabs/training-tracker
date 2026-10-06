@@ -4,7 +4,7 @@ A phone-first PWA for logging lifting workouts. It is a static site with no fram
 
 The app ships with no workout program. Import your own from Settings › Import Program (a JSON file with `sessions`, optional `warmup`, `notes` and `dayMapping`).
 
-**Status:** Phase 1 of 4 (foundation, Today screen, workout logger, JSON backup and restore). Log and Progress tabs are placeholders until Phases 2 and 4.
+**Status:** Phase 2 of 4 (workout logger, daily logs for water, sleep, bodyweight, nutrition and runs, auto checklist, JSON backup and restore). The Progress tab is a placeholder until Phase 4.
 
 ## Run locally
 
