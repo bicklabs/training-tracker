@@ -1,8 +1,9 @@
 (() => {
   'use strict';
+  const L = window.TTLogic; // pure rules, see logic.js
 
   // ---------- Constants ----------
-  const VERSION = '0.2.0'; // keep equal to CACHE in sw.js
+  const VERSION = '0.3.0'; // keep equal to CACHE in sw.js
   const SCHEMA = 1;
   const DB_NAME = 'training-tracker';
   const BACKUP_FILE = 'training-tracker-backup.json';
@@ -148,6 +149,9 @@
       waterQuickAdds: [8, 16, 34],
       targets: { protein: 140, calories: 3100, waterBaseOz: 100, sleepHours: 8, bedtime: '22:30', runMinutesWeek: [60, 120] },
       customItems: [],
+      setsPromptDone: false,
+      deloadDismissedOn: null,
+      reviewAppliedOn: null,
       lastBackupAt: null,
     };
   }
@@ -169,9 +173,10 @@
     if (!open.length) { state.active = null; return; }
     const w = open[0];
     const sets = (await db.byIndex('sets', 'workoutId', w.id)).sort(setOrder);
-    const last = {};
-    for (let i = 0; i < w.plan.length; i++) last[i] = await lastSets(w.plan[i].name, w.id);
-    state.active = { w, sets, last };
+    const hist = await loadHistory();
+    const last = {}, sugg = {};
+    for (let i = 0; i < w.plan.length; i++) ({ last: last[i], sugg: sugg[i] } = exerciseInfo(hist, w.plan[i], w.id, programWeek(w.date)));
+    state.active = { w, sets, last, sugg };
   }
 
   const setOrder = (a, b) => a.exIndex - b.exIndex || a.setNumber - b.setNumber;
@@ -203,21 +208,6 @@
     return sessionById(order[(order.indexOf(last.sessionId) + 1) % order.length]);
   }
 
-  // Most recent finished session that included this exercise.
-  async function lastSets(name, excludeWorkoutId) {
-    const rows = (await db.byIndex('sets', 'exerciseName', name)).filter((s) => s.done && s.workoutId !== excludeWorkoutId);
-    if (!rows.length) return null;
-    const byW = new Map();
-    for (const s of rows) (byW.get(s.workoutId) || byW.set(s.workoutId, []).get(s.workoutId)).push(s);
-    let best = null;
-    for (const [wid, sets] of byW) {
-      const w = await db.get('workouts', wid);
-      if (!w || w.status !== 'done') continue;
-      const t = w.finishedAt || w.startedAt;
-      if (!best || t > best.t) best = { t, date: w.date, sets: sets.sort((a, b) => a.setNumber - b.setNumber) };
-    }
-    return best;
-  }
   function fmtSet(s, ex) {
     if (ex?.type === 'timed') return `${s.seconds ?? '?'}s`;
     const w = s.weightLb != null ? `${fmtNum(s.weightLb)}×` : '×';
@@ -232,7 +222,6 @@
       reps: null, seconds: null, rir: null, done: false, timestamp: Date.now(),
     };
   }
-  const prefillWeight = (last, i) => (last ? (last.sets[i] ?? last.sets[last.sets.length - 1])?.weightLb ?? null : null);
 
   async function startWorkout(sessionId) {
     if (state.active) { go('train'); return; }
@@ -240,16 +229,18 @@
     if (!session) return;
     const plan = session.exercises.map((e) => ({ ...structuredClone(e), origName: e.name, swappedFrom: null }));
     const w = { id: uid(), date: dateKey(), sessionId, sessionName: session.name, startedAt: Date.now(), finishedAt: null, energy: null, note: '', status: 'in-progress', plan };
-    const last = {};
+    const hist = await loadHistory();
+    const week = programWeek(w.date);
+    const last = {}, sugg = {};
     const sets = [];
     for (let i = 0; i < plan.length; i++) {
-      last[i] = await lastSets(plan[i].name, w.id);
-      for (let n = 1; n <= plan[i].sets; n++) sets.push(blankSet(w, i, n, plan[i], prefillWeight(last[i], n - 1)));
+      ({ last: last[i], sugg: sugg[i] } = exerciseInfo(hist, plan[i], w.id, week));
+      for (let n = 1; n <= plan[i].sets; n++) sets.push(blankSet(w, i, n, plan[i], sugg[i].weight));
     }
     try {
       await db.write([['put', 'workouts', w], ...sets.map((s) => ['put', 'sets', s])]);
     } catch { toast('Could not start the workout. Browser storage is full or blocked.'); return; }
-    state.active = { w, sets, last };
+    state.active = { w, sets, last, sugg };
     clearRest();
     go('train');
   }
@@ -261,11 +252,11 @@
     if (!newName || newName === ex.name) return;
     ex.name = newName;
     ex.swappedFrom = newName === ex.origName ? null : ex.origName;
-    a.last[exIndex] = await lastSets(newName, a.w.id);
+    ({ last: a.last[exIndex], sugg: a.sugg[exIndex] } = exerciseInfo(await loadHistory(), ex, a.w.id, programWeek(a.w.date)));
     const mine = a.sets.filter((s) => s.exIndex === exIndex);
     mine.forEach((s) => {
       s.exerciseName = newName; s.swappedFrom = ex.swappedFrom;
-      if (!s.done) s.weightLb = prefillWeight(a.last[exIndex], s.setNumber - 1);
+      if (!s.done) s.weightLb = a.sugg[exIndex].weight;
     });
     await db.write([['put', 'workouts', a.w], ...mine.map((s) => ['put', 'sets', s])]).catch(() => toast('Could not save the swap.'));
     render();
@@ -392,12 +383,7 @@
     const [h, m] = t.split(':').map(Number);
     return `${h % 12 || 12}:${pad(m)} ${h < 12 ? 'AM' : 'PM'}`;
   };
-  // Hours slept; handles bedtimes before midnight. Returns null when bed and wake are equal.
-  function sleepHours(bed, wake) {
-    let d = mins(wake) - mins(bed);
-    if (d < 0) d += 1440;
-    return d === 0 ? null : r1(d / 60);
-  }
+  const sleepHours = L.sleepHours;
   // Times before noon count as "after midnight", so 12:30 AM is later than 11 PM.
   const lateAdj = (m) => (m < 720 ? m + 1440 : m);
   const bedOnTime = (bed) => lateAdj(mins(bed)) <= lateAdj(mins(state.settings.targets.bedtime));
@@ -418,10 +404,13 @@
       db.byIndex('water', 'date', date), db.byIndex('sleep', 'date', date), db.get('bodyweight', date),
       db.get('nutrition', date), db.get('checklist', date), db.byIndex('runs', 'date', date), db.byIndex('workouts', 'date', date),
     ]);
+    const lifts = workouts.filter((w) => w.status === 'done');
+    const trainingMin = lifts.reduce((n, w) => n + Math.max(0, ((w.finishedAt || w.startedAt) - w.startedAt) / 60000), 0) + runs.reduce((n, r) => n + r.durationMin, 0);
     return {
       date, water: water.sort((a, b) => a.timestamp - b.timestamp), sleep: sleepRows[0] || null, weight: weight || null,
       nutrition: nutrition || null, checklist: checklist || { date, creatine: false, items: {} },
-      runs, workouts: workouts.filter((w) => w.status === 'done'),
+      runs, workouts: lifts, trainingMin: Math.round(trainingMin),
+      waterTarget: L.waterTarget(state.settings.targets.waterBaseOz, trainingMin),
     };
   }
   const sumOz = (d) => d.water.reduce((n, w) => n + w.amountOz, 0);
@@ -434,7 +423,7 @@
     const items = [
       { key: 'creatine', label: 'Creatine (5 g)', done: !!d.checklist.creatine, sub: 'Tap to check off', act: 'toggle' },
       { key: 'protein', label: 'Protein target hit', done: protein != null && protein >= t.protein, sub: `${protein ?? 0} of ${t.protein} g`, act: 'sheet-nutrition' },
-      { key: 'water', label: 'Water target hit', done: total >= t.waterBaseOz, sub: `${fmtWater(total)} of ${fmtWater(t.waterBaseOz)}`, act: 'sheet-water' },
+      { key: 'water', label: 'Water target hit', done: total >= d.waterTarget, sub: `${fmtWater(total)} of ${fmtWater(d.waterTarget)}`, act: 'sheet-water' },
       { key: 'weight', label: 'Weighed in', done: !!d.weight, sub: d.weight ? `${fmtNum(d.weight.weightLb)} lb` : 'Morning weight', act: 'sheet-weight' },
       { key: 'sleep', label: 'Logged sleep', done: !!d.sleep, sub: d.sleep ? `${d.sleep.hours} h` : 'Bedtime and wake time', act: 'sheet-sleep' },
       { key: 'bed', label: 'In bed on time', done: !!d.sleep && bedOnTime(d.sleep.bedtime), sub: d.sleep ? `Bedtime ${fmtHM(d.sleep.bedtime)}` : `Target ${fmtHM(t.bedtime)}`, act: 'sheet-sleep' },
@@ -476,15 +465,20 @@
   }
 
   // Generic form sheet: onSave(dlg, fail) returns false to keep the sheet open.
-  function formSheet({ title, body, onSave, onDelete, onInput, onClick }) {
+  function formSheet({ title, body, onSave, onDelete, onInput, onClick, onClose }) {
     const dlg = openSheet(title, `<div class="stack">${body}<p class="caption err" id="sheet-err" hidden></p>
       <button class="btn btn-primary" data-save>Save</button>${onDelete ? '<button class="btn btn-danger" data-delete>Delete</button>' : ''}<button class="btn btn-outline" data-cancel>Cancel</button></div>`);
+    // onClose runs once however the sheet closes (buttons call it directly; Esc and swipes use the close event).
+    let afterRan = false;
+    const after = () => { if (afterRan || !onClose) return; afterRan = true; onClose(); };
+    dlg.onclose = after;
+    const shut = () => { dlg.close(); after(); };
     const fail = (m) => { const el = $('#sheet-err', dlg); el.textContent = m; el.hidden = false; return false; };
-    const save = async () => { if ((await onSave(dlg, fail)) !== false) dlg.close(); };
+    const save = async () => { if ((await onSave(dlg, fail)) !== false) shut(); };
     dlg.onclick = (e) => {
-      if (e.target === dlg || e.target.closest('[data-cancel]')) return dlg.close();
+      if (e.target === dlg || e.target.closest('[data-cancel]')) return shut();
       if (e.target.closest('[data-save]')) return save();
-      if (e.target.closest('[data-delete]')) { dlg.close(); return onDelete(); }
+      if (e.target.closest('[data-delete]')) { shut(); return onDelete(); }
       onClick && onClick(e, dlg);
     };
     dlg.onkeydown = (e) => { if (e.key === 'Enter' && e.target.tagName === 'INPUT') { e.preventDefault(); save(); } };
@@ -562,9 +556,8 @@
       onSave: async (dlg, fail) => {
         const w = num($('#f-w', dlg).value);
         if (w == null || w < 40 || w > 800) return fail('Enter a weight between 40 and 800 lb.');
-        const ops = [['put', 'bodyweight', { date, weightLb: r1(w) }]];
-        if (state.settings.bodyweightLb == null) { state.settings.bodyweightLb = r1(w); saveSettings(); }
-        if (!(await persist(ops))) return false;
+        if (!(await persist([['put', 'bodyweight', { date, weightLb: r1(w) }]]))) return false;
+        await syncBodyweightBasis();
         render();
       },
       onDelete: ex && (() => removeWithUndo('bodyweight', ex)),
@@ -638,9 +631,10 @@
     const p = d.nutrition?.proteinG ?? 0;
     const h = d.sleep ? d.sleep.hours : null;
     return `<section class="card">${cardHead('chart', 'Today So Far')}
-      ${meter('Water', `${esc(fmtWater(total))} / ${esc(fmtWater(t.waterBaseOz))}`, (total / t.waterBaseOz) * 100)}
+      ${meter('Water', `${esc(fmtWater(total))} / ${esc(fmtWater(d.waterTarget))}`, (total / d.waterTarget) * 100)}
       ${meter('Protein', `${p} / ${t.protein} g`, (p / t.protein) * 100)}
-      ${meter('Sleep last night', `${h == null ? '—' : h} / ${t.sleepHours} h`, h == null ? 0 : (h / t.sleepHours) * 100)}</section>`;
+      ${meter('Sleep last night', `${h == null ? '—' : h} / ${t.sleepHours} h`, h == null ? 0 : (h / t.sleepHours) * 100)}
+      ${d.waterTarget > t.waterBaseOz ? `<p class="caption">Water target includes ${esc(fmtWater(d.waterTarget - t.waterBaseOz))} for ${d.trainingMin} min of training.</p>` : ''}</section>`;
   }
 
   // ---------- Render: Log ----------
@@ -673,6 +667,8 @@
     const d = await dayData(date);
     const t = state.settings.targets;
     const total = sumOz(d);
+    const bwAll = await db.all('bodyweight');
+    const bwAvg = L.movingAverage(bwAll, date), bwRate = L.weeklyRate(bwAll, date);
     const main = (a, b) => `<div class="main"><p class="t">${a}</p>${b ? `<p class="s">${b}</p>` : ''}</div>`;
     let html = pageHead('log', 'Log', fmtDate(date, { weekday: 'long', month: 'short', day: 'numeric' }));
 
@@ -684,7 +680,7 @@
 
     html += checklistCard(d, date);
 
-    html += `<section class="card">${cardHead('drop', 'Water', `<span class="pill ${total >= t.waterBaseOz ? 'good-pill' : 'soft-pill'}">${esc(fmtWater(total))} / ${esc(fmtWater(t.waterBaseOz))}</span>`)}
+    html += `<section class="card">${cardHead('drop', 'Water', `<span class="pill ${total >= d.waterTarget ? 'good-pill' : 'soft-pill'}">${esc(fmtWater(total))} / ${esc(fmtWater(d.waterTarget))}</span>`)}
       ${d.water.length ? `<div class="rows">${d.water.map((w) => `<button class="list-btn" data-act="edit-water" data-id="${esc(w.id)}" data-date="${date}">${main(esc(fmtTime(w.timestamp)))}<span class="v">${esc(fmtWater(w.amountOz))}</span></button>`).join('')}</div>` : '<p class="caption">No water logged.</p>'}
       <button class="btn btn-outline" data-act="sheet-water" data-date="${date}">Add Water</button></section>`;
 
@@ -695,6 +691,7 @@
 
     html += `<section class="card">${cardHead('scale', 'Bodyweight')}
       ${d.weight ? `<p class="big">${esc(fmtNum(d.weight.weightLb))} lb</p>` : '<p class="caption">No weigh-in yet.</p>'}
+      ${bwAvg == null ? '<p class="caption">The 7-day average needs 4 weigh-ins in a week.</p>' : `<p class="caption">7-day average ${esc(r1(bwAvg))} lb${bwRate == null ? '' : ` · ${bwRate >= 0 ? '+' : ''}${r2(bwRate)} lb/week (target 0.4–0.8)`}</p>`}
       <button class="btn btn-outline" data-act="sheet-weight" data-date="${date}">${d.weight ? 'Edit Weight' : 'Log Weight'}</button></section>`;
 
     const n = d.nutrition;
@@ -704,7 +701,7 @@
 
     html += `<section class="card">${cardHead('dumbbell', 'Training')}
       ${d.workouts.length || d.runs.length ? `<div class="rows">
-        ${d.workouts.map((w) => `<div class="row"><div class="badge">${icon('dumbbell', 18, false)}</div>${main(esc(shortName(w.sessionName)), 'Lifting')}<span class="v">${Math.max(1, Math.round(((w.finishedAt || w.startedAt) - w.startedAt) / 60000))} min</span></div>`).join('')}
+        ${d.workouts.map((w) => `<button class="list-btn" data-act="edit-workout" data-id="${esc(w.id)}"><div class="badge">${icon('dumbbell', 18, false)}</div>${main(esc(shortName(w.sessionName)), 'Lifting · tap to edit')}<span class="v">${Math.max(1, Math.round(((w.finishedAt || w.startedAt) - w.startedAt) / 60000))} min</span></button>`).join('')}
         ${d.runs.map((r) => `<button class="list-btn" data-act="edit-run" data-id="${esc(r.id)}" data-date="${date}"><div class="badge">${icon('run', 18, false)}</div>${main(`${esc(r2(r.distanceMi))} mi · ${esc(r.type)}`, `${esc(fmtPace(r.durationMin, r.distanceMi))} /mi${r.rpe ? ` · RPE ${r.rpe}` : ''}`)}<span class="v">${esc(fmtDur(r.durationMin))}</span></button>`).join('')}</div>` : '<p class="caption">No training logged.</p>'}
       <button class="btn btn-outline" data-act="sheet-run" data-date="${date}">Log Run</button></section>`;
 
@@ -722,6 +719,7 @@
         <div class="field"><span>Time</span>${seg('time', [['12h', '12-Hour'], ['24h', '24-Hour']], s.units.time)}</div></section>
       <section class="card">${cardHead('chart', 'Daily Targets')}
         <label class="field"><span>Protein (g)</span><input class="input" inputmode="numeric" data-target="protein" value="${esc(t.protein)}"></label>
+        ${s.bodyweightLb ? `<p class="caption">For ${esc(fmtNum(s.bodyweightLb))} lb, the target is ${L.proteinTarget(s.bodyweightLb)} g (range ${L.proteinRange(s.bodyweightLb).join('–')} g). It updates when your 7-day average moves 5 lb.</p>` : ''}
         <label class="field"><span>Calories (optional)</span><input class="input" inputmode="numeric" data-target="calories" value="${esc(t.calories)}"></label>
         <label class="field"><span>Water (oz)</span><input class="input" inputmode="numeric" data-target="waterBaseOz" value="${esc(t.waterBaseOz)}"></label>
         <label class="field"><span>Sleep (hours)</span><input class="input" inputmode="decimal" data-target="sleepHours" value="${esc(t.sleepHours)}"></label>
@@ -733,6 +731,309 @@
         <p class="caption">Creatine and the automatic items are built in. Add your own, like a vitamin or stretching.</p>
         ${s.customItems.length ? `<div class="rows">${s.customItems.map((it) => `<div class="row"><div class="main"><p class="t">${esc(it.label)}</p></div><button class="chip" data-act="rm-item" data-id="${esc(it.id)}">Remove</button></div>`).join('')}</div>` : ''}
         <div class="two"><input class="input" id="new-item" maxlength="30" placeholder="New item" aria-label="New checklist item"><button class="btn btn-outline" data-act="add-item">Add</button></div></section>`;
+  }
+
+  // ---------- History and suggestions ----------
+  async function loadHistory() {
+    const [ws, sets] = await Promise.all([db.all('workouts'), db.all('sets')]);
+    return { workouts: ws.filter((w) => w.status === 'done'), sets: sets.filter((s) => s.done) };
+  }
+  // Finished sessions that included this exercise, newest first.
+  function sessionsFor(hist, name, excludeId, n = 3) {
+    const byW = new Map();
+    for (const s of hist.sets) {
+      if (s.exerciseName !== name || s.workoutId === excludeId) continue;
+      if (!byW.has(s.workoutId)) byW.set(s.workoutId, []);
+      byW.get(s.workoutId).push(s);
+    }
+    const out = [];
+    for (const w of hist.workouts) {
+      const sets = byW.get(w.id);
+      if (sets) out.push({ t: w.finishedAt || w.startedAt, date: w.date, sets: sets.sort((a, b) => a.setNumber - b.setNumber) });
+    }
+    return out.sort((a, b) => b.t - a.t).slice(0, n);
+  }
+  function exerciseInfo(hist, ex, excludeId, week) {
+    const sessions = sessionsFor(hist, ex.name, excludeId);
+    return { last: sessions[0] || null, sugg: L.suggest(sessions, ex, week) };
+  }
+  const exerciseDefs = () => state.program.sessions.flatMap((s) => s.exercises);
+  const isMainLift = (e) => e.type === 'compound' && e.restSec >= 150;
+  // Exercises whose latest finished session was within sinceDays and that have stalled.
+  function stalledLifts(hist, today, sinceDays) {
+    const week = programWeek(today), since = L.addDays(today, -(sinceDays - 1)), seen = new Set(), out = [];
+    for (const ex of exerciseDefs()) {
+      if (seen.has(ex.name)) continue;
+      seen.add(ex.name);
+      const sessions = sessionsFor(hist, ex.name, null);
+      if (sessions.length && sessions[0].date >= since && L.suggest(sessions, ex, week).kind === 'stalled') out.push(ex);
+    }
+    return out;
+  }
+  const effortLine = (ex, week) => {
+    const e = L.effort(week);
+    const rir = e.minRir === e.maxRir ? `${e.maxRir}` : `${e.minRir}–${e.maxRir}`;
+    return `Target RIR ${rir}${week >= 3 && ex.type === 'isolation' ? ', last set to failure (RIR 0)' : ''}`;
+  };
+
+  // ---------- Bodyweight basis for targets ----------
+  // Protein follows bodyweight. Set it from the first weigh-in, then again when the 7-day average moves 5 lb or more.
+  async function syncBodyweightBasis() {
+    const s = state.settings;
+    const entries = await db.all('bodyweight');
+    if (!entries.length) return;
+    const latest = entries.sort((a, b) => (a.date < b.date ? 1 : -1))[0];
+    const avg = L.movingAverage(entries, dateKey());
+    let next = null;
+    if (s.bodyweightLb == null) next = latest.weightLb;
+    else if (avg != null && Math.abs(avg - s.bodyweightLb) >= 5) next = r1(avg);
+    if (next == null) return;
+    s.bodyweightLb = next;
+    s.targets.protein = L.proteinTarget(next);
+    await saveSettings();
+    toast(`Protein target set to ${s.targets.protein} g for ${fmtNum(next)} lb`, { duration: 5000 });
+  }
+
+  // ---------- Insights: set prompt, deload, weekly review ----------
+  async function insightCards(done, today, hist) {
+    const s = state.settings;
+    const week = programWeek(today);
+    let html = '';
+
+    if (week >= 6 && week <= 8 && !s.setsPromptDone && state.program.sessions.length) {
+      html += `<section class="card">${cardHead('plus', 'Add a Set?')}
+        <p class="caption">Recovering well? Add 1 set to the first two exercises of each session.</p>
+        <button class="btn btn-primary" data-act="sets-apply">Add the Sets</button>
+        <button class="btn btn-outline" data-act="sets-skip">Not Now</button></section>`;
+    }
+
+    const dismissed = s.deloadDismissedOn && daysBetween(s.deloadDismissedOn, today) < 7;
+    if (!dismissed && state.program.sessions.length) {
+      const stalledMain = stalledLifts(hist, today, 7).filter(isMainLift);
+      const reasons = [];
+      if (stalledMain.length >= 2) reasons.push(`${stalledMain.map((e) => shortName(e.name)).join(' and ')} have stalled this week`);
+      if (L.lowEnergyStreak(done.map((w) => w.energy))) reasons.push('you rated energy 1–2 for three sessions in a row');
+      if (reasons.length) {
+        html += `<section class="card">${cardHead('flame', 'Consider a Deload', '<span class="pill warn-pill">Suggested</span>')}
+          <p class="caption">${esc(reasons.join(', and ').replace(/^./, (c) => c.toUpperCase()))}. Try a deload week: half the sets at about 10% lighter weights.</p>
+          <button class="btn btn-outline" data-act="deload-dismiss">Not Now</button></section>`;
+      }
+    }
+
+    if (parseKey(today).getDay() === 0) html += await weeklyReviewCard(hist, today);
+    return html;
+  }
+
+  async function weeklyReviewCard(hist, today) {
+    const s = state.settings, t = s.targets;
+    const [bw, water, sleep, nut, runs] = await Promise.all(['bodyweight', 'water', 'sleep', 'nutrition', 'runs'].map((n) => db.all(n)));
+    const start = L.addDays(today, -6);
+    const inWin = (x) => x.date >= start && x.date <= today;
+    const gain = L.twoWeekGain(bw, today);
+    const review = gain == null ? null : L.reviewMessage(gain);
+
+    const planned = Object.values(s.dayMapping).filter((v) => sessionById(v)).length;
+    const completed = hist.workouts.filter(inWin).length;
+
+    const names = [...new Set(hist.sets.filter((x) => hist.workouts.some((w) => w.id === x.workoutId && inWin(w))).map((x) => x.exerciseName))];
+    const defs = new Map(exerciseDefs().map((e) => [e.name, e]));
+    const up = [];
+    for (const name of names) {
+      const two = sessionsFor(hist, name, null, 2);
+      const timed = defs.get(name)?.type === 'timed';
+      if (two.length === 2 && two[0].date >= start && L.progressed(L.sessionPerf(two[1].sets, timed), L.sessionPerf(two[0].sets, timed))) up.push(shortName(name));
+    }
+    const stalled = stalledLifts(hist, today, 14).map((e) => shortName(e.name));
+
+    const sl = sleep.filter(inWin);
+    const avgSleep = sl.length ? r1(sl.reduce((n, x) => n + x.hours, 0) / sl.length) : null;
+    const byDay = new Map();
+    water.filter(inWin).forEach((w) => byDay.set(w.date, (byDay.get(w.date) || 0) + w.amountOz));
+    const avgWater = byDay.size ? [...byDay.values()].reduce((n, v) => n + v, 0) / byDay.size : null;
+    const proteinDays = nut.filter(inWin).filter((n) => n.proteinG != null && n.proteinG >= t.protein).length;
+    const runMin = Math.round(runs.filter(inWin).reduce((n, r) => n + r.durationMin, 0));
+    const row = (a, b) => `<div class="row"><div class="main"><p class="t">${esc(a)}</p></div><span class="v">${esc(b)}</span></div>`;
+    const list = (a) => (a.length ? a.join(', ') : 'None');
+
+    return `<section class="card">${cardHead('chart', 'Weekly Review', '<span class="pill soft-pill">Sunday</span>')}
+      ${review ? `<p class="big" style="font-size:20px">${esc(review.text)}</p><p class="caption">Average gain over the last 2 weeks: ${gain >= 0 ? '+' : ''}${r2(gain)} lb/week (target 0.4–0.8).</p>
+        ${review.delta && s.reviewAppliedOn !== today ? `<button class="btn btn-primary" data-act="review-apply" data-delta="${review.delta}">${review.delta > 0 ? 'Raise' : 'Lower'} Calorie Target by 200</button>` : ''}`
+        : '<p class="caption">Calorie advice needs at least 4 weigh-ins in each of the last 3 weeks.</p>'}
+      <div class="rows">
+        ${row('Workouts done', `${completed} of ${planned}`)}
+        ${row('Lifts that went up', list(up))}
+        ${row('Stalled lifts', list(stalled))}
+        ${row('Average sleep', avgSleep == null ? '—' : `${avgSleep} h`)}
+        ${row('Average water', avgWater == null ? '—' : fmtWater(avgWater))}
+        ${row('Protein target hit', `${proteinDays} of 7 days`)}
+        ${row('Running', `${runMin} min (goal 60–120)`)}
+      </div></section>`;
+  }
+
+  // ---------- Edit a finished workout ----------
+  async function editWorkoutSheet(id) {
+    const w = await db.get('workouts', id);
+    if (!w) return;
+    const rows = (await db.byIndex('sets', 'workoutId', id)).sort(setOrder);
+    const original = structuredClone(rows);
+    const removed = new Set();
+    let energy = w.energy;
+    const field = (f, s, ph, mode) => `<input class="input" data-f="${f}" inputmode="${mode}" placeholder="${ph}" value="${s[f] == null ? '' : esc(fmtNum(s[f]))}">`;
+    const setHtml = (s, ex) => {
+      const timed = ex.type === 'timed';
+      const rirOpts = ['<option value="">—</option>', ...[0, 1, 2, 3, 4, 5].map((n) => `<option value="${n}"${s.rir === n ? ' selected' : ''}>${n}</option>`)].join('');
+      return `<div class="set${timed ? ' timed' : ''}" data-eset="${esc(s.id)}"><span class="sn">${s.setNumber}</span>
+        ${timed ? field('seconds', s, 'sec', 'numeric') : field('weightLb', s, 'lb', 'decimal') + field('reps', s, 'reps', 'numeric')}
+        <select class="input" data-f="rir" aria-label="Reps in reserve">${rirOpts}</select>
+        <button type="button" class="check" data-rm aria-label="Remove set">${icon('minus', 22, false)}</button></div>`;
+    };
+    const bodyHtml = () => w.plan.map((ex, i) => {
+      const sets = rows.filter((s) => s.exIndex === i);
+      return `<div class="stack" style="gap:8px"><h3 class="eh">${esc(ex.name)}</h3>${sets.map((s) => setHtml(s, ex)).join('') || '<p class="caption">No sets.</p>'}<div><button type="button" class="chip" data-addset="${i}">${icon('plus', 16, false)}Set</button></div></div>`;
+    }).join('');
+    const collect = (dlg) => $$('[data-eset]', dlg).forEach((row) => { const s = rows.find((x) => x.id === row.dataset.eset); if (s) readRow(row, s); });
+
+    formSheet({
+      title: `${shortName(w.sessionName)} · ${fmtDate(w.date, { month: 'short', day: 'numeric' })}`,
+      body: `<div class="stack" id="ew-body">${bodyHtml()}</div>
+        <div><p class="caption" style="margin-bottom:8px">Energy (1 low, 5 high)</p>${segHtml('f-energy', [1, 2, 3, 4, 5].map((n) => [n, n]), energy)}</div>
+        <label class="field"><span>Note (optional)</span><textarea class="input" id="f-note" maxlength="500">${esc(w.note || '')}</textarea></label>`,
+      onClick: (e, dlg) => {
+        const rm = e.target.closest('[data-rm]');
+        const add = e.target.closest('[data-addset]');
+        const en = segPick(e, dlg, 'f-energy');
+        if (en !== null) { energy = en === '' ? null : Number(en); return; }
+        if (!rm && !add) return;
+        collect(dlg);
+        if (rm) {
+          const sid = rm.closest('[data-eset]').dataset.eset;
+          removed.add(sid);
+          rows.splice(rows.findIndex((x) => x.id === sid), 1);
+        } else {
+          const i = Number(add.dataset.addset);
+          const mine = rows.filter((x) => x.exIndex === i);
+          const prev = mine[mine.length - 1];
+          const n = (prev ? prev.setNumber : 0) + 1;
+          rows.push({ ...blankSet(w, i, n, w.plan[i], prev ? prev.weightLb : null), done: true });
+          rows.sort(setOrder);
+        }
+        $('#ew-body', dlg).innerHTML = bodyHtml();
+      },
+      onSave: async (dlg, fail) => {
+        collect(dlg);
+        if (!rows.length) return fail('Keep at least one set, or delete the workout.');
+        const next = { ...w, energy, note: $('#f-note', dlg).value.trim().slice(0, 500) };
+        const ops = [...[...removed].map((sid) => ['delete', 'sets', sid]), ['put', 'workouts', next], ...rows.map((s) => ['put', 'sets', { ...s, done: true }])];
+        if (!(await persist(ops))) return false;
+        toast('Workout updated');
+        render();
+      },
+      onDelete: async () => {
+        const c = await ask({ title: 'Delete Workout?', message: 'This removes the workout and all of its sets.', buttons: [{ label: 'Delete Workout', value: true, style: 'btn-danger' }, { label: 'Cancel', value: false }] });
+        if (!c) return;
+        if (!(await persist([['delete', 'workouts', w.id], ...original.map((s) => ['delete', 'sets', s.id])]))) return;
+        toast('Workout deleted', { action: 'Undo', duration: 6000, onAction: async () => { if (await persist([['put', 'workouts', w], ...original.map((s) => ['put', 'sets', s])])) render(); } });
+        render();
+      },
+    });
+  }
+
+  // ---------- Edit program ----------
+  async function saveProgram(sessions) {
+    let result;
+    try { result = normalizeProgram({ ...state.program, sessions }); }
+    catch (e) { toast(e.message, { duration: 5000 }); return false; }
+    if (!(await persist([['put', 'program', result.program]]))) return false;
+    state.program = result.program;
+    return true;
+  }
+  function programSheet() {
+    const sessions = state.program.sessions;
+    const dlg = openSheet('Edit Program', `<div class="stack"><div class="rows">${sessions.map((s) => `<button class="list-btn" data-s="${esc(s.id)}"><div class="main"><p class="t">${esc(s.name)}</p><p class="s">${s.exercises.length} exercises</p></div>${icon('right', 18, false)}</button>`).join('')}</div>
+      <p class="caption">Changes apply to future workouts. Workouts you already logged are not changed.</p>
+      <button class="btn btn-outline" data-close>Done</button></div>`);
+    dlg.onclick = (e) => {
+      if (e.target === dlg || e.target.closest('[data-close]')) { dlg.close(); return render(); }
+      const b = e.target.closest('[data-s]');
+      if (b) sessionEditor(b.dataset.s);
+    };
+    dlg.onclose = () => render();
+  }
+  function sessionEditor(sid) {
+    const s = sessionById(sid);
+    if (!s) return programSheet();
+    const dlg = openSheet('Edit Session', `<div class="stack">
+      <label class="field"><span>Session name</span><input class="input" id="s-name" maxlength="80" value="${esc(s.name)}"></label>
+      <div class="rows">${s.exercises.map((ex, i) => `<div class="row"><div class="main"><p class="t">${esc(ex.name)}</p><p class="s">${esc(targetText(ex))}</p></div>
+        <button class="chip" data-up="${i}" aria-label="Move up"${i === 0 ? ' disabled' : ''}>↑</button><button class="chip" data-down="${i}" aria-label="Move down"${i === s.exercises.length - 1 ? ' disabled' : ''}>↓</button><button class="chip" data-edit="${i}">Edit</button></div>`).join('')}</div>
+      <button class="btn btn-outline" data-add>Add Exercise</button>
+      <button class="btn btn-primary" data-back>Back</button></div>`);
+    dlg.onchange = async (e) => {
+      if (e.target.id !== 's-name') return;
+      const name = e.target.value.trim();
+      if (name) await saveProgram(state.program.sessions.map((x) => (x.id === sid ? { ...x, name } : x)));
+    };
+    dlg.onclick = async (e) => {
+      if (e.target === dlg) { dlg.close(); return render(); }
+      if (e.target.closest('[data-back]')) return programSheet();
+      if (e.target.closest('[data-add]')) return exerciseSheet(sid, null);
+      const ed = e.target.closest('[data-edit]');
+      if (ed) return exerciseSheet(sid, Number(ed.dataset.edit));
+      const mv = e.target.closest('[data-up],[data-down]');
+      if (mv) {
+        const i = Number(mv.dataset.up ?? mv.dataset.down), j = mv.dataset.up !== undefined ? i - 1 : i + 1;
+        const ex = [...s.exercises];
+        [ex[i], ex[j]] = [ex[j], ex[i]];
+        if (await saveProgram(state.program.sessions.map((x) => (x.id === sid ? { ...x, exercises: ex } : x)))) sessionEditor(sid);
+      }
+    };
+    dlg.onclose = () => render();
+  }
+  function exerciseSheet(sid, idx) {
+    const s = sessionById(sid);
+    const old = idx == null ? { name: '', type: 'compound', sets: 3, reps: [8, 10], restSec: 90, alt: '', increment: 5 } : s.exercises[idx];
+    const typeOpts = ['compound', 'isolation', 'bodyweight', 'timed'].map((t) => `<option value="${t}"${old.type === t ? ' selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('');
+    const pair = (id, v, label) => `<div class="two"><label class="field"><span>${label} low</span><input class="input" id="${id}-lo" inputmode="numeric" value="${v ? v[0] : ''}"></label><label class="field"><span>${label} high</span><input class="input" id="${id}-hi" inputmode="numeric" value="${v ? v[1] : ''}"></label></div>`;
+    const sheet = formSheet({
+      title: idx == null ? 'Add Exercise' : 'Edit Exercise',
+      body: `<label class="field"><span>Name</span><input class="input" id="x-name" maxlength="80" value="${esc(old.name)}"></label>
+        <label class="field"><span>Type</span><select class="input" id="x-type">${typeOpts}</select></label>
+        <label class="field"><span>Sets</span><input class="input" id="x-sets" inputmode="numeric" value="${old.sets}"></label>
+        ${pair('x-reps', old.reps, 'Reps')}
+        <div id="x-secs">${pair('x-sec', old.seconds, 'Seconds')}</div>
+        <div class="two"><label class="field"><span>Rest (sec)</span><input class="input" id="x-rest" inputmode="numeric" value="${old.restSec}"></label>
+        <label class="field"><span>Weight step (lb)</span><input class="input" id="x-inc" inputmode="decimal" placeholder="None" value="${old.increment ?? ''}"></label></div>
+        <label class="field"><span>Swap alternative</span><input class="input" id="x-alt" maxlength="80" value="${esc(old.alt || '')}"></label>
+        <label class="field"><span>Done on each side?</span><select class="input" id="x-side"><option value="no">No</option><option value="yes"${old.perSide ? ' selected' : ''}>Yes, per side</option></select></label>
+        <label class="field"><span>Main muscles (comma separated)</span><input class="input" id="x-pri" maxlength="80" value="${esc((old.primary || []).join(', '))}"></label>
+        <label class="field"><span>Helper muscles (optional)</span><input class="input" id="x-sec" maxlength="80" value="${esc((old.secondary || []).join(', '))}"></label>
+        <p class="caption">Renaming an exercise starts a new history for it. Use Swap during a workout for one-off changes.</p>`,
+      onInput: (dlg) => { $('#x-secs', dlg).hidden = $('#x-type', dlg).value !== 'timed'; $('#x-reps-lo', dlg).closest('.two').hidden = $('#x-type', dlg).value === 'timed'; },
+      onSave: async (dlg, fail) => {
+        const g = (id) => $(`#${id}`, dlg).value;
+        const type = g('x-type');
+        const list = (v) => v.split(',').map((x) => x.trim()).filter(Boolean).slice(0, 6);
+        const ex = { ...old, name: g('x-name').trim(), type, sets: num(g('x-sets')), restSec: num(g('x-rest')) ?? 90, alt: g('x-alt').trim(), perSide: g('x-side') === 'yes', primary: list(g('x-pri')), secondary: list(g('x-sec')) };
+        const inc = num(g('x-inc'));
+        if (inc) ex.increment = inc; else delete ex.increment;
+        if (!ex.perSide) delete ex.perSide;
+        if (!ex.secondary.length) delete ex.secondary;
+        if (type === 'timed') { ex.seconds = [num(g('x-sec-lo')), num(g('x-sec-hi'))]; delete ex.reps; }
+        else { ex.reps = [num(g('x-reps-lo')), num(g('x-reps-hi'))]; delete ex.seconds; }
+        if (!ex.name) return fail('Enter a name.');
+        const exercises = [...s.exercises];
+        if (idx == null) exercises.push(ex); else exercises[idx] = ex;
+        try { normalizeProgram({ sessions: state.program.sessions.map((x) => (x.id === sid ? { ...x, exercises } : x)) }); }
+        catch (e) { return fail(e.message); }
+        if (!(await saveProgram(state.program.sessions.map((x) => (x.id === sid ? { ...x, exercises } : x))))) return false;
+      },
+      onDelete: idx == null ? null : async () => {
+        const exercises = s.exercises.filter((_, i) => i !== idx);
+        if (await saveProgram(state.program.sessions.map((x) => (x.id === sid ? { ...x, exercises } : x)))) sessionEditor(sid);
+      },
+      onClose: () => sessionEditor(sid),
+    });
+    return sheet;
   }
 
   // ---------- Render: Today ----------
@@ -786,6 +1087,8 @@
       }
     }
 
+    html += await insightCards(done, today, await loadHistory());
+
     const dd = await dayData(today);
     html += quickAddCard(today) + metersCard(dd) + checklistCard(dd, today);
 
@@ -823,17 +1126,17 @@
     const a = state.active;
     const sets = a.sets.filter((s) => s.exIndex === i);
     const last = a.last[i];
+    const sg = a.sugg[i];
     const timed = ex.type === 'timed';
-    let lastText;
-    if (last) lastText = `Last (${fmtDate(last.date, { month: 'short', day: 'numeric' })}): ${last.sets.map((s) => fmtSet(s, ex)).join(' · ')}`;
-    else if (ex.type === 'compound' || ex.type === 'isolation') lastText = 'First time: pick a weight you can do for the top of the range with about 3 reps left.';
-    else lastText = 'First time logging this one.';
+    const lastText = last ? `Last (${fmtDate(last.date, { month: 'short', day: 'numeric' })}): ${last.sets.map((s) => fmtSet(s, ex)).join(' · ')}` : '';
     return `<section class="card" data-ex="${i}">
       <div class="ex-head"><div class="tt"><h2>${esc(ex.name)}</h2>
         <p class="sub">${esc(targetText(ex))}</p>
         ${ex.swappedFrom ? `<p class="sub swapped">Swapped from ${esc(ex.swappedFrom)}</p>` : `<p class="sub">Swap: ${esc(ex.alt)}</p>`}</div>
         <button class="chip" data-act="swap">${icon('swap', 16, false)}Swap</button></div>
-      <p class="last">${esc(lastText)}</p>
+      ${lastText ? `<p class="last">${esc(lastText)}</p>` : ''}
+      <p class="sugg ${sg.kind}">${esc(sg.text)}</p>
+      <p class="hint">${esc(effortLine(ex, programWeek(a.w.date)))}</p>
       <div class="stack" style="gap:8px">
         <div class="set-head${timed ? ' timed' : ''}"><span>Set</span>${timed ? '<span>Sec</span>' : '<span>Lb</span><span>Reps</span>'}<span>RIR</span><span></span></div>
         ${sets.map((s) => setRow(s, ex)).join('')}
@@ -856,6 +1159,7 @@
     const w = a.w;
     return pageHead('dumbbell', shortName(w.sessionName), `Week ${programWeek(w.date)} · started ${esc(fmtTime(w.startedAt))} · <span data-elapsed>${Math.floor((Date.now() - w.startedAt) / 60000)} min</span>`, true) +
       `<section class="card"><div class="warmup"><span class="ico">${icon('flame', 20)}</span><span><strong>Warm-up.</strong> ${esc(state.program.warmup)}</span></div></section>` +
+      `<section class="card"><div class="warmup"><span class="ico">${icon('shield', 20)}</span><span><strong>Week ${programWeek(w.date)}.</strong> ${esc(L.effort(programWeek(w.date)).text)}</span></div></section>` +
       w.plan.map(exerciseCard).join('') +
       `<button class="btn btn-primary" data-act="finish">Finish Workout</button>
        <button class="btn btn-danger" data-act="discard">Discard Workout</button>`;
@@ -880,6 +1184,7 @@
       ${renderLoggingSettings()}
       <section class="card">${cardHead('dumbbell', 'Program')}
         <p class="caption">${state.program.sessions.length ? `${state.program.sessions.length} sessions loaded: ${esc(state.program.sessions.map((x) => shortName(x.name)).join(', '))}.` : 'No program loaded.'}</p>
+        ${state.program.sessions.length ? '<button class="btn btn-primary" data-act="edit-program">Edit Program</button>' : ''}
         <button class="btn btn-outline" data-act="import-program">${icon('download', 20, false)}Import Program File</button>
         <p class="caption">A JSON file with your sessions and exercises. It replaces the current program but keeps your logged workouts.</p></section>
       <section class="card">${cardHead('today', 'Profile')}
@@ -939,8 +1244,10 @@
     dlg.innerHTML = `<div class="handle"></div><h2>${esc(title)}</h2>${html}`;
     dlg.oninput = null;
     dlg.onkeydown = null;
+    dlg.onchange = null;
+    dlg.onclose = null;
     dlg.onclick = (e) => { if (e.target === dlg) dlg.close(); };
-    dlg.showModal();
+    if (!dlg.open) dlg.showModal();
     return dlg;
   }
 
@@ -1125,6 +1432,23 @@
       if (act === 'sheet-run') return runSheet(date);
       if (act === 'edit-run') return runSheet(date, btn.dataset.id);
       if (act === 'toggle') return toggleItem(date, btn.dataset.key);
+      if (act === 'edit-workout') return editWorkoutSheet(btn.dataset.id);
+      if (act === 'edit-program') return programSheet();
+      if (act === 'deload-dismiss') { state.settings.deloadDismissedOn = dateKey(); await saveSettings(); return render(); }
+      if (act === 'sets-skip') { state.settings.setsPromptDone = true; await saveSettings(); return render(); }
+      if (act === 'sets-apply') {
+        const next = state.program.sessions.map((s) => ({ ...s, exercises: s.exercises.map((e, i) => (i < 2 ? { ...e, sets: Math.min(20, e.sets + 1) } : e)) }));
+        if (await saveProgram(next)) { state.settings.setsPromptDone = true; await saveSettings(); toast('Added 1 set to the first two exercises of each session'); render(); }
+        return;
+      }
+      if (act === 'review-apply') {
+        const delta = Number(btn.dataset.delta);
+        state.settings.targets.calories = Math.max(1000, state.settings.targets.calories + delta);
+        state.settings.reviewAppliedOn = dateKey();
+        await saveSettings();
+        toast(`Calorie target is now ${state.settings.targets.calories}`);
+        return render();
+      }
       if (act === 'log-prev' || act === 'log-next') {
         const d = parseKey(state.logDate || dateKey());
         d.setDate(d.getDate() + (act === 'log-next' ? 1 : -1));
@@ -1210,7 +1534,12 @@
       }
       if (t.dataset.logdate !== undefined) { if (t.value && t.value <= dateKey()) { state.logDate = t.value; render(); } return; }
       if (t.dataset.day !== undefined) { state.settings.dayMapping[t.dataset.day] = t.value; await saveSettings(); toast('Schedule updated'); return; }
-      if (t.dataset.setting === 'bodyweightLb') { state.settings.bodyweightLb = num(t.value); await saveSettings(); return; }
+      if (t.dataset.setting === 'bodyweightLb') {
+        const v = num(t.value);
+        state.settings.bodyweightLb = v;
+        if (v) { state.settings.targets.protein = L.proteinTarget(v); toast(`Protein target set to ${state.settings.targets.protein} g`); }
+        await saveSettings(); render(); return;
+      }
       if (t.dataset.setting === 'programStartDate' && t.value) { state.settings.programStartDate = t.value; await saveSettings(); render(); }
     });
 
@@ -1279,6 +1608,13 @@
     }
     try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch { /* request only */ }
     state.view = state.active ? 'train' : 'today';
+    if (new URLSearchParams(location.search).has('dev')) {
+      // Dev only: ?dev=1 loads dev/sample-data.js, which is not part of the upload folder.
+      window.__tt = { db, state, STORES, uid, dateKey, loadState, render, L };
+      const sc = document.createElement('script');
+      sc.src = 'dev/sample-data.js';
+      document.head.appendChild(sc);
+    }
     render();
     registerSW();
   }

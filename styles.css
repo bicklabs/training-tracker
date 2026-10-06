@@ -270,3 +270,9 @@ dialog::backdrop { background: var(--scrim); }
 .datenav .chip:disabled { opacity: .35; }
 .datenav .input { text-align: center; }
 .err { color: var(--danger); }
+
+/* ---------- Suggestions ---------- */
+.sugg { font-size: 14px; font-weight: 600; color: var(--primary-text); background: var(--primary-soft); border-radius: 14px; padding: 8px 12px; }
+.sugg.stalled { background: var(--warn-soft); color: var(--warn); }
+.sugg.first { font-weight: 500; }
+.eh { font-size: 15px; font-weight: 700; margin: 6px 0 0; }
