@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#0E0F12">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="Training">
+  <title>Training Tracker</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <script src="theme.js"></script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="update-banner" class="update-banner" hidden>New version ready · Tap to update</div>
+  <main id="view" class="page" aria-live="polite"></main>
+
+  <div id="restbar" class="restbar" hidden></div>
+
+  <nav class="tabbar" aria-label="Main">
+    <button data-view="today"><span data-icon="today" data-size="24"></span><span>Today</span></button>
+    <button data-view="train"><span data-icon="dumbbell" data-size="24"></span><span>Train</span></button>
+    <button data-view="log"><span data-icon="log" data-size="24"></span><span>Log</span></button>
+    <button data-view="progress"><span data-icon="chart" data-size="24"></span><span>Progress</span></button>
+    <button data-view="settings"><span data-icon="gear" data-size="24"></span><span>Settings</span></button>
+  </nav>
+
+  <div id="toast" class="toast" hidden></div>
+  <dialog id="sheet" class="sheet"></dialog>
+  <dialog id="ask" class="ask"></dialog>
+  <input type="file" id="program-file" accept="application/json,.json" hidden>
+  <input type="file" id="restore-file" accept="application/json,.json" hidden>
+
+  <script src="app.js"></script>
+</body>
+</html>
